@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tolk</string>
+    <string name="process_text_label">Translate with Tolk</string>
+    <string name="screen_service_label">Tolk floating translator</string>
+    <string name="screen_service_description">Shows a floating button over other apps. When you tap it, Tolk reads the text on screen, or takes a screenshot if there is no text, and sends it to the model you picked in Tolk to translate it. Nothing is read until you tap.</string>
+    <string name="tile_label">Tolk</string>
+</resources>
