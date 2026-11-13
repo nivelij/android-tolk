@@ -118,14 +118,23 @@ class ParsingTest {
     }
 
     @Test
-    fun `screen lines come out in reading order without repeats`() {
-        val lines = listOf(
-            dev.nivelij.tolk.screen.ScreenLine("Zweite Zeile", top = 300, left = 40),
-            dev.nivelij.tolk.screen.ScreenLine("Rechts", top = 105, left = 600),
-            dev.nivelij.tolk.screen.ScreenLine("Überschrift", top = 100, left = 40),
-            dev.nivelij.tolk.screen.ScreenLine("Zweite Zeile", top = 302, left = 40),
-        )
-        assertEquals("Überschrift\nRechts\nZweite Zeile", dev.nivelij.tolk.screen.joinScreenLines(lines))
+    fun `screen blocks drop repeats and stop at the character cap`() {
+        val b = { t: String -> dev.nivelij.tolk.screen.ScreenBlock(t, 0, 0, 10, 10) }
+        val capped = dev.nivelij.tolk.screen.capBlocks(listOf(b("Kopf"), b("Kopf"), b("Absatz eins"), b("Absatz zwei")), maxChars = 16)
+        assertEquals(listOf("Kopf", "Absatz eins"), capped.map { it.text })
+    }
+
+    @Test
+    fun `screen translation maps items back by number`() {
+        val raw = """
+            {"lang":"de"}
+            {"i":0,"t":"Pretzel"}
+            {"i":2,"t":"Baked goods"}
+            {"i":3,"t":"Half a li
+        """.trimIndent()
+        val parsed = dev.nivelij.tolk.data.parseScreenTranslation(raw)
+        assertEquals("de", parsed.lang)
+        assertEquals(mapOf(0 to "Pretzel", 2 to "Baked goods"), parsed.items)
     }
 
     @Test

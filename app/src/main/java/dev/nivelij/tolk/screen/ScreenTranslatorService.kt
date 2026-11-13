@@ -15,13 +15,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.ComposeView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.nivelij.tolk.Status
-import dev.nivelij.tolk.data.DetectedLanguageSplitter
 import dev.nivelij.tolk.data.Languages
 import dev.nivelij.tolk.data.Photos
 import dev.nivelij.tolk.data.Prefs
 import dev.nivelij.tolk.data.Prompts
 import dev.nivelij.tolk.data.Settings
 import dev.nivelij.tolk.data.parsePhotoResult
+import dev.nivelij.tolk.data.parseScreenTranslation
 import dev.nivelij.tolk.net.Message
 import dev.nivelij.tolk.net.OpenRouter
 import dev.nivelij.tolk.net.batched
@@ -56,6 +56,10 @@ class ScreenTranslatorService : AccessibilityService() {
     private var target: ComposeView? = null
     private var targetOwner: OverlayOwner? = null
     private val nearTarget = MutableStateFlow(false)
+    private var inPlace: ComposeView? = null
+    private var inPlaceOwner: OverlayOwner? = null
+    private var bar: ComposeView? = null
+    private var barLifecycle: OverlayOwner? = null
     private var panel: ComposeView? = null
     private var panelOwner: OverlayOwner? = null
 
@@ -79,12 +83,20 @@ class ScreenTranslatorService : AccessibilityService() {
         }
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    // The in-place view is a snapshot; once the page scrolls or changes, its boxes no longer line up.
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null || inPlace == null || event.packageName == packageName) return
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_SCROLLED,
+            AccessibilityEvent.TYPE_VIEW_CLICKED,
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> closeAll()
+        }
+    }
     override fun onInterrupt() = Unit
 
     override fun onDestroy() {
         scope.cancel()
-        closePanel()
+        closeAll()
         hideBubble()
         super.onDestroy()
     }
@@ -195,21 +207,22 @@ class ScreenTranslatorService : AccessibilityService() {
     private fun bubbleSizePx() = (BUBBLE_DP * resources.displayMetrics.density).toInt()
 
     private fun onBubbleTap() {
-        if (panel != null) return closePanel()
+        if (panel != null || inPlace != null) return closeAll()
         val root = appWindowRoot()
         job?.cancel()
         job = scope.launch {
             val started = System.nanoTime()
-            val text = withContext(Dispatchers.Default) { ScreenReader.read(root) }
-            Log.d(TAG, "Read ${text.length} chars in ${(System.nanoTime() - started) / 1_000_000} ms")
+            val blocks = withContext(Dispatchers.Default) { ScreenReader.read(root) }
+            val chars = blocks.sumOf { it.text.length }
+            Log.d(TAG, "Read ${blocks.size} blocks, $chars chars in ${(System.nanoTime() - started) / 1_000_000} ms")
             val prefs = settings.prefs.first()
             if (prefs.apiKey == null) {
                 state.value = ScreenState(status = Status.Failed("Add your OpenRouter key in Tolk first."))
                 openPanel()
                 return@launch
             }
-            if (text.length >= MIN_TEXT) {
-                translateText(prefs, text)
+            if (chars >= MIN_TEXT) {
+                translateBlocks(prefs, blocks)
             } else {
                 val shot = captureScreen()
                 if (shot == null) {
@@ -228,14 +241,21 @@ class ScreenTranslatorService : AccessibilityService() {
         .let { apps -> apps.firstOrNull { it.isFocused } ?: apps.maxByOrNull { it.layer } }
         ?.root ?: rootInActiveWindow
 
-    private suspend fun translateText(prefs: Prefs, text: String) {
-        state.value = ScreenState(mode = ScreenMode.Text, status = Status.Working)
-        openPanel()
-        val target = Languages.byCode(prefs.target)
-        val splitter = DetectedLanguageSplitter(expectTag = true)
-        stream(prefs, prefs.textModel, Prompts.translate(text, Languages.auto, target, prefs.tone, Prompts.SCREEN_CONTEXT), "minimal") { chunk ->
-            splitter.feed(chunk)
-            state.update { it.copy(output = splitter.body, detected = splitter.tag) }
+    private suspend fun translateBlocks(prefs: Prefs, blocks: List<ScreenBlock>) {
+        state.value = ScreenState(mode = ScreenMode.Text, blocks = blocks, status = Status.Working)
+        openInPlace()
+        val raw = StringBuilder()
+        val prompt = Prompts.screen(blocks.map { it.text }, Languages.byCode(prefs.target), prefs.tone)
+        stream(prefs, prefs.textModel, prompt, "minimal") { chunk ->
+            raw.append(chunk)
+            val parsed = parseScreenTranslation(raw.toString())
+            state.update {
+                it.copy(
+                    detected = parsed.lang,
+                    items = parsed.items,
+                    output = blocks.indices.mapNotNull { i -> parsed.items[i] }.joinToString("\n"),
+                )
+            }
         }
     }
 
@@ -288,31 +308,88 @@ class ScreenTranslatorService : AccessibilityService() {
         }
     }
 
-    private fun openPanel() {
-        if (panel != null) return
+    private fun overlayParams() = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+        PixelFormat.TRANSLUCENT,
+    ).apply { fitInsetsTypes = 0 }
+
+    private fun overlayView(content: @androidx.compose.runtime.Composable (Prefs) -> Unit): Pair<ComposeView, OverlayOwner> {
         val owner = OverlayOwner()
         val view = ComposeView(this).apply {
             setContent {
-                val current by state.collectAsStateWithLifecycle()
                 val prefs by settings.prefs.collectAsStateWithLifecycle(initialValue = null)
-                prefs?.let { ScreenPanel(current, Languages.byCode(it.target), onClose = ::closePanel, onRetry = ::onRetry) }
+                prefs?.let { content(it) }
             }
         }
         owner.attach(view)
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT,
-        ).apply { fitInsetsTypes = 0 }
+        return view to owner
+    }
+
+    private fun openInPlace() {
+        if (inPlace != null) return
+        val (view, owner) = overlayView { prefs ->
+            val current by state.collectAsStateWithLifecycle()
+            InPlaceOverlay(current, Languages.byCode(prefs.target))
+        }
+        val params = overlayParams().apply {
+            flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
         windowManager.addView(view, params)
+        inPlace = view
+        inPlaceOwner = owner
+
+        val (barView, barOwner) = overlayView { prefs ->
+            val current by state.collectAsStateWithLifecycle()
+            InPlaceBar(current, Languages.byCode(prefs.target), onList = ::showList, onClose = ::closeAll, onRetry = ::onRetry)
+        }
+        val barParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = (24 * resources.displayMetrics.density).toInt()
+        }
+        windowManager.addView(barView, barParams)
+        bar = barView
+        barLifecycle = barOwner
+    }
+
+    private fun openPanel() {
+        if (panel != null) return
+        val (view, owner) = overlayView { prefs ->
+            val current by state.collectAsStateWithLifecycle()
+            ScreenPanel(current, Languages.byCode(prefs.target), onClose = ::closeAll, onRetry = ::onRetry)
+        }
+        windowManager.addView(view, overlayParams())
         panel = view
         panelOwner = owner
     }
 
-    private fun closePanel() {
+    private fun showList() {
+        removeInPlace()
+        openPanel()
+    }
+
+    private fun removeInPlace() {
+        inPlace?.let { windowManager.removeView(it) }
+        inPlaceOwner?.destroy()
+        inPlace = null
+        inPlaceOwner = null
+        bar?.let { windowManager.removeView(it) }
+        barLifecycle?.destroy()
+        bar = null
+        barLifecycle = null
+    }
+
+    private fun closeAll() {
         job?.cancel()
+        removeInPlace()
         panel?.let { windowManager.removeView(it) }
         panelOwner?.destroy()
         panel = null
@@ -320,7 +397,7 @@ class ScreenTranslatorService : AccessibilityService() {
     }
 
     private fun onRetry() {
-        closePanel()
+        closeAll()
         onBubbleTap()
     }
 

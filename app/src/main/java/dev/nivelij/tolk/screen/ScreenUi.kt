@@ -8,6 +8,17 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.IntOffset
+import dev.nivelij.tolk.ui.Atkinson
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -70,6 +81,8 @@ enum class ScreenMode { Text, Photo }
 
 data class ScreenState(
     val mode: ScreenMode = ScreenMode.Text,
+    val blocks: List<ScreenBlock> = emptyList(),
+    val items: Map<Int, String> = emptyMap(),
     val output: String = "",
     val detected: String? = null,
     val photo: PhotoResult = PhotoResult(null, emptyList()),
@@ -254,5 +267,104 @@ private fun CopyPill(text: String) {
             background = Color.White.copy(alpha = 0.14f),
             content = c.onSheet,
         )
+    }
+}
+
+// Display-only: the window is not touchable, so taps and scrolls reach the page underneath.
+@Composable
+fun InPlaceOverlay(state: ScreenState, target: Language) {
+    TolkTheme {
+        val c = Tolk.colors
+        val accent = languageColor(target.code, c.dark)
+        val view = LocalView.current
+        var origin by remember { mutableStateOf<IntOffset?>(null) }
+        Box(
+            Modifier
+                .fillMaxSize()
+                .onGloballyPositioned {
+                    val location = IntArray(2).also(view::getLocationOnScreen)
+                    origin = IntOffset(location[0], location[1])
+                },
+        ) {
+            val offset = origin ?: return@Box
+            // Big blocks first so small ones (links, buttons) end up on top when boxes overlap.
+            state.blocks.withIndex()
+                .sortedByDescending { (_, b) -> b.width.toLong() * b.height }
+                .forEach { (i, block) ->
+                    val text = state.items[i] ?: return@forEach
+                    if (text.isBlank() || text == block.text) return@forEach
+                    FittedBlock(text, block, offset, accent)
+                }
+        }
+    }
+}
+
+@Composable
+private fun FittedBlock(text: String, block: ScreenBlock, origin: IntOffset, accent: Color) {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val padding = with(density) { 4.dp.roundToPx() }
+    // Shrink until the text fits the original box without splitting a word; if even the smallest size
+    // can't fit the longest word, widen the box instead of breaking it mid-word.
+    val (style, widthPx) = remember(text, block) {
+        val base = TextStyle(fontFamily = Atkinson, color = Color(0xFF1C2333))
+        val innerWidth = (block.width - padding * 2).coerceAtLeast(1)
+        val innerHeight = block.height - padding * 2
+        val longestWord = text.split(' ').maxByOrNull { it.length }.orEmpty()
+        val minPx = 10f * density.density
+        var sizePx = (block.height / 1.35f).coerceIn(minPx, 24f * density.density)
+        var fitted: TextStyle
+        var wordWidth: Int
+        while (true) {
+            fitted = with(density) { base.copy(fontSize = sizePx.toSp(), lineHeight = (sizePx * 1.22f).toSp()) }
+            wordWidth = measurer.measure(longestWord, fitted, maxLines = 1).size.width
+            val height = measurer.measure(text, fitted, constraints = Constraints(maxWidth = maxOf(innerWidth, wordWidth))).size.height
+            if ((height <= innerHeight && wordWidth <= innerWidth) || sizePx <= minPx) break
+            sizePx -= density.density
+        }
+        fitted to maxOf(block.width, wordWidth + padding * 2 + 1)
+    }
+    with(density) {
+        Box(
+            Modifier
+                .offset { IntOffset(block.left - origin.x, block.top - origin.y) }
+                .width(widthPx.toDp())
+                .heightIn(min = block.height.toDp())
+                .shadow(2.dp, RoundedCornerShape(5.dp))
+                .clip(RoundedCornerShape(5.dp))
+                .background(Color(0xFFFBFBFD))
+                .border(1.dp, accent.copy(alpha = 0.45f), RoundedCornerShape(5.dp))
+                .padding(4.dp),
+        ) {
+            BasicText(text, style = style)
+        }
+    }
+}
+
+@Composable
+fun InPlaceBar(state: ScreenState, target: Language, onList: () -> Unit, onClose: () -> Unit, onRetry: () -> Unit) = TolkTheme {
+    val c = Tolk.colors
+    Row(
+        Modifier
+            .padding(12.dp)
+            .shadow(14.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
+            .clip(CircleShape)
+            .background(languageColor(target.code, c.dark))
+            .padding(start = 18.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        val label = when (val status = state.status) {
+            Status.Working -> "Translating ${state.items.size} of ${state.blocks.size}"
+            is Status.Failed -> status.message
+            Status.Idle -> state.detected?.let { "From ${Languages.byCode(it).name}" } ?: "Into ${target.name}"
+        }
+        BasicText(label, style = Tolk.type.small.copy(color = c.onSheet), maxLines = 2, modifier = Modifier.weight(1f, fill = false))
+        if (state.status is Status.Failed) {
+            Pill("Retry", onRetry, background = Color.White.copy(alpha = 0.16f), content = c.onSheet, style = Tolk.type.small)
+        } else {
+            Pill("List", onList, background = Color.White.copy(alpha = 0.16f), content = c.onSheet, style = Tolk.type.small)
+        }
+        RoundButton(Icons.Close, "Close", onClose, background = Color.White.copy(alpha = 0.16f), tint = c.onSheet, size = 38.dp)
     }
 }

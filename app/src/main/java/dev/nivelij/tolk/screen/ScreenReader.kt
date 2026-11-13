@@ -3,20 +3,20 @@ package dev.nivelij.tolk.screen
 import android.graphics.Rect
 import android.view.accessibility.AccessibilityNodeInfo
 
-data class ScreenLine(val text: String, val top: Int, val left: Int)
+data class ScreenBlock(val text: String, val left: Int, val top: Int, val right: Int, val bottom: Int) {
+    val width get() = right - left
+    val height get() = bottom - top
+}
 
 object ScreenReader {
-    fun read(root: AccessibilityNodeInfo?): String {
-        root ?: return ""
+    private const val MAX_CHARS = 8000
+
+    fun read(root: AccessibilityNodeInfo?): List<ScreenBlock> {
+        root ?: return emptyList()
         val webViews = mutableListOf<AccessibilityNodeInfo>()
         findWebViews(root, webViews)
-        return if (webViews.isNotEmpty()) {
-            capLines(webViews.flatMap(::readWeb))
-        } else {
-            val lines = mutableListOf<ScreenLine>()
-            collectNative(root, null, lines)
-            joinScreenLines(lines)
-        }
+        val blocks = if (webViews.isNotEmpty()) webViews.flatMap(::readWeb) else readNative(root)
+        return capBlocks(blocks, MAX_CHARS)
     }
 
     // In a browser only the page counts, not the address bar or tab strip.
@@ -28,40 +28,60 @@ object ScreenReader {
         for (i in 0 until node.childCount) node.getChild(i)?.let { findWebViews(it, out) }
     }
 
+    private class Builder {
+        val runs = mutableListOf<String>()
+        val rect = Rect()
+
+        fun add(text: String, bounds: Rect) {
+            runs += text
+            rect.union(bounds)
+        }
+
+        fun build(): ScreenBlock? {
+            val text = joinRuns(runs)
+            if (text.isBlank() || rect.isEmpty) return null
+            return ScreenBlock(text, rect.left, rect.top, rect.right, rect.bottom)
+        }
+    }
+
     // Browsers expose a paragraph as many small text runs (one per link, bold word, footnote), so runs are
     // glued back together per wide container instead of being treated as separate lines.
-    private fun readWeb(web: AccessibilityNodeInfo): List<String> {
-        val pageWidth = Rect().also(web::getBoundsInScreen).width()
-        val blocks = mutableListOf<MutableList<String>>()
+    private fun readWeb(web: AccessibilityNodeInfo): List<ScreenBlock> {
+        val page = Rect().also(web::getBoundsInScreen)
+        val builders = mutableListOf<Builder>()
 
-        fun walk(node: AccessibilityNodeInfo, block: MutableList<String>) {
+        fun walk(node: AccessibilityNodeInfo, block: Builder) {
             if (!node.isVisibleToUser) return
             val bounds = Rect().also(node::getBoundsInScreen)
-            val own = if (node.childCount >= 2 && bounds.width() >= pageWidth * 0.6) {
-                mutableListOf<String>().also { blocks += it }
-            } else {
-                block
-            }
+            if (!bounds.intersect(page)) return
+            val own = if (node.childCount >= 2 && bounds.width() >= page.width() * 0.6) Builder().also { builders += it } else block
             val text = node.text?.toString()
             if (!text.isNullOrBlank() && !node.isPassword) {
-                if (node.className?.endsWith("Button") == true) blocks += mutableListOf(text) else own += text
+                if (node.className?.endsWith("Button") == true) builders += Builder().also { it.add(text, bounds) } else own.add(text, bounds)
             }
             for (i in 0 until node.childCount) node.getChild(i)?.let { walk(it, own) }
         }
 
-        walk(web, mutableListOf<String>().also { blocks += it })
-        return blocks.map(::joinRuns).filter { it.isNotBlank() }
+        walk(web, Builder().also { builders += it })
+        return builders.mapNotNull(Builder::build)
     }
 
-    private fun collectNative(node: AccessibilityNodeInfo, parentText: String?, out: MutableList<ScreenLine>) {
-        if (!node.isVisibleToUser) return
-        val text = node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() && !node.isPassword }
-        val repeatsParent = text != null && parentText != null && parentText.contains(text)
-        if (text != null && !repeatsParent) {
-            val bounds = Rect().also(node::getBoundsInScreen)
-            out += ScreenLine(text, bounds.top, bounds.left)
+    private fun readNative(root: AccessibilityNodeInfo): List<ScreenBlock> {
+        val out = mutableListOf<ScreenBlock>()
+
+        fun walk(node: AccessibilityNodeInfo, parentText: String?) {
+            if (!node.isVisibleToUser) return
+            val text = node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() && !node.isPassword }
+            val repeatsParent = text != null && parentText != null && parentText.contains(text)
+            if (text != null && !repeatsParent) {
+                val b = Rect().also(node::getBoundsInScreen)
+                if (!b.isEmpty) out += ScreenBlock(text, b.left, b.top, b.right, b.bottom)
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { walk(it, text ?: parentText) }
         }
-        for (i in 0 until node.childCount) node.getChild(i)?.let { collectNative(it, text ?: parentText, out) }
+
+        walk(root, null)
+        return out.sortedWith(compareBy<ScreenBlock>({ it.top / 12 }, { it.left }))
     }
 }
 
@@ -84,18 +104,14 @@ fun joinRuns(runs: List<String>): String {
     return out.toString().replace(footnote, "").replace(whitespace, " ").replace(" .", ".").replace(" ,", ",").trim()
 }
 
-fun joinScreenLines(lines: List<ScreenLine>, maxChars: Int = 8000): String =
-    capLines(lines.sortedWith(compareBy<ScreenLine>({ it.top / 12 }, { it.left })).map { it.text }, maxChars)
-
-private fun capLines(lines: List<String>, maxChars: Int = 8000): String {
-    val out = StringBuilder()
-    var previous: String? = null
-    for (line in lines) {
-        if (line == previous) continue
-        if (out.length + line.length > maxChars) break
-        if (out.isNotEmpty()) out.append('\n')
-        out.append(line)
-        previous = line
+fun capBlocks(blocks: List<ScreenBlock>, maxChars: Int): List<ScreenBlock> {
+    val out = mutableListOf<ScreenBlock>()
+    var total = 0
+    for (block in blocks) {
+        if (out.lastOrNull()?.text == block.text) continue
+        if (total + block.text.length > maxChars) break
+        out += block
+        total += block.text.length
     }
-    return out.toString()
+    return out
 }

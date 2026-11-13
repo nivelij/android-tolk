@@ -25,9 +25,24 @@ object Prompts {
         return listOf(Message("system", system), Message("user", text))
     }
 
-    const val SCREEN_CONTEXT =
-        "Text captured from a phone screen, one item per line in reading order. Lines can be headlines, paragraphs, " +
-            "links, buttons or fragments of a web page. Keep one output line per input line, and leave lines that are already in the target language as they are."
+    fun screen(lines: List<String>, target: Language, tone: Tone): List<Message> {
+        val system = buildString {
+            appendLine("You translate text captured from a phone screen into ${target.name}.")
+            appendLine("Input: one numbered item per line as \"<number><TAB><text>\", in reading order. Items are headlines, paragraphs, links, buttons or labels.")
+            appendLine("Reply in JSON Lines only, no code fences, no other text.")
+            appendLine("""First line: {"lang": the main source language code}""")
+            appendLine("""Then one line per item, in order: {"i": number, "t": translation}""")
+            appendLine("Each translation is drawn over the original, so keep it about as long as the original. Keep names, numbers and formatting.")
+            appendLine("If an item is already in ${target.name}, or is only a name, number or symbol, return it unchanged.")
+            when (tone) {
+                Tone.Formal -> appendLine("Use a formal, polite register.")
+                Tone.Casual -> appendLine("Use a casual, friendly register.")
+                Tone.Auto -> appendLine("Match the register of the original.")
+            }
+        }
+        val numbered = lines.mapIndexed { i, line -> "$i\t${line.replace('\n', ' ')}" }.joinToString("\n")
+        return listOf(Message("system", system), Message("user", numbered))
+    }
 
     fun explain(source: String, translation: String, target: Language): List<Message> = listOf(
         Message(
@@ -114,4 +129,22 @@ fun parsePhotoResult(raw: String): PhotoResult {
             }
         }
     return PhotoResult(summary, items)
+}
+
+data class ScreenTranslation(val lang: String?, val items: Map<Int, String>)
+
+fun parseScreenTranslation(raw: String): ScreenTranslation {
+    var lang: String? = null
+    val items = mutableMapOf<Int, String>()
+    raw.lineSequence()
+        .map { it.trim().removeSuffix(",") }
+        .filter { it.startsWith("{") && it.endsWith("}") }
+        .forEach { line ->
+            val json = runCatching { JSONObject(line) }.getOrNull() ?: return@forEach
+            when {
+                json.has("i") && json.has("t") -> items[json.optInt("i", -1)] = json.optString("t")
+                json.has("lang") -> lang = json.optString("lang").ifBlank { null }
+            }
+        }
+    return ScreenTranslation(lang, items)
 }
