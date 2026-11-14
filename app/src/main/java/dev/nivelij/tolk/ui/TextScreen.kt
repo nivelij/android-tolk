@@ -44,6 +44,8 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
@@ -120,6 +122,13 @@ fun TextScreen(
     val source = Languages.byCode(prefs.source)
     val target = Languages.byCode(prefs.target)
     var showContext by rememberSaveable { mutableStateOf(state.context.isNotEmpty()) }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
+    val translate = {
+        keyboard?.hide()
+        focus.clearFocus()
+        onTranslate()
+    }
 
     Column(Modifier.fillMaxSize().imePadding()) {
         Header(onSettings)
@@ -172,7 +181,7 @@ fun TextScreen(
             Box(Modifier.weight(1f))
             Pill(
                 text = "Translate",
-                onClick = onTranslate,
+                onClick = translate,
                 enabled = state.input.isNotBlank() && state.status != Status.Working,
                 background = c.ink,
                 content = c.background,
@@ -202,7 +211,7 @@ fun TextScreen(
         }
 
         TranslationSheet(target.code, Modifier.weight(1f).padding(top = 18.dp)) {
-            TextResult(prefs, state, target, onTranslate, onExplain, onSettings)
+            TextResult(prefs, state, target, translate, onExplain, onSettings)
         }
     }
 }
